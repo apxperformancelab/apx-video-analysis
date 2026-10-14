@@ -1,0 +1,306 @@
+"""APX video analysis, step 4: outputs.
+
+Side-on 10m (after apx_accel.py):
+  python3 apx_render.py accel --work WORKDIR --name "Athlete Name" --out OUTDIR
+    -> APX_<Name>_10m_Side_Overlay.mp4, APX_<Name>_10m_Touchdown_Reel.jpg,
+       APX_<Name>_10m_Early_Drive_[annotated|clean].jpg, APX_<Name>_10m_Peak_Drive_Lean_[annotated|clean].jpg,
+       APX_<Name>_10m_Data.xlsx
+
+Any clip, skeleton only (front-on until front metrics are validated):
+  python3 apx_render.py plain --work WORKDIR --name "Athlete Name" --out OUTDIR --label "10m Front"
+    -> APX_<Name>_<label>_Overlay.mp4 and <WORKDIR>/pick_frames.jpg (numbered frames to choose a still from)
+
+Export a still from any analysed clip:
+  python3 apx_render.py still --work WORKDIR --name "Athlete Name" --out OUTDIR --frame K --slot "10m Front-On Arm and Knee Drive"
+"""
+import argparse, json, os, subprocess, warnings, cv2, numpy as np, pandas as pd
+warnings.filterwarnings('ignore')
+from PIL import Image, ImageDraw, ImageFont
+
+ap = argparse.ArgumentParser()
+ap.add_argument('mode', choices=['accel', 'plain', 'still', 'reel', 'video'])
+ap.add_argument('--work', required=True); ap.add_argument('--name', required=True); ap.add_argument('--out', required=True)
+ap.add_argument('--label', default='10m Front'); ap.add_argument('--frame', type=int); ap.add_argument('--slot', default='Still'); ap.add_argument('--caption', default=''); ap.add_argument('--trunk-only', action='store_true')
+ap.add_argument('--stills', nargs='*', default=[]); ap.add_argument('--inputs', nargs='*', default=[]); ap.add_argument('--test', default='10m Acceleration')
+a = ap.parse_args()
+os.makedirs(a.out, exist_ok=True)
+TAG = a.name.strip().replace(' ', '_')
+
+# ---------- brand ----------
+FLUORO = (204, 255, 0); WHITE = (255, 255, 255); BG = (10, 10, 10); GREY = (150, 150, 150); TRUNK = (77, 195, 255)
+def font(sz, bold=True):
+    for p in (['/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'] if bold else ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf']):
+        if os.path.exists(p): return ImageFont.truetype(p, sz)
+    return ImageFont.load_default()
+bgr = lambda c: (c[2], c[1], c[0])
+
+def load_frames(path):
+    cap = cv2.VideoCapture(path); fr = []
+    while True:
+        ok, f = cap.read()
+        if not ok: break
+        fr.append(f)
+    return fr
+frames = load_frames(f'{a.work}/work.mp4'); N = len(frames); H, W = frames[0].shape[:2]
+A = f'{a.work}/analysis'
+if os.path.exists(f'{A}/K_img.npy'):
+    K = np.load(f'{A}/K_img.npy')
+else:  # plain mode without analysis: raw keypoints, lightly cleaned
+    d = json.load(open(f'{a.work}/kp.json')); K = np.full((N, 17, 2), np.nan)
+    for r in d['frames']:
+        if r['kp'] is not None: K[r['frame']] = np.array(r['kp'])[:, :2]
+    from scipy.signal import savgol_filter
+    ok = ~np.isnan(K[:, 0, 0]); idx = np.where(ok)[0]
+    for j in range(17):
+        for c in range(2):
+            K[:, j, c] = np.interp(np.arange(N), idx, K[idx, j, c])
+    K = savgol_filter(K, 5, 2, axis=0)
+valid = ~np.isnan(K[:, 0, 0])
+
+def draw_skel(img, k, sc=1.0, off=(0, 0), th=3):
+    q = lambda xy: (int((xy[0] - off[0]) * sc), int((xy[1] - off[1]) * sc))
+    hm = (k[11] + k[12]) / 2; sm = (k[5] + k[6]) / 2
+    for col, (el, wr, kn, an) in ((FLUORO, (7, 9, 13, 15)), (WHITE, (8, 10, 14, 16))):
+        c = bgr(col)
+        for p1, p2 in ((sm, k[el]), (k[el], k[wr]), (hm, k[kn]), (k[kn], k[an])):
+            cv2.line(img, q(p1), q(p2), c, th, cv2.LINE_AA)
+        for j in (el, wr, kn, an): cv2.circle(img, q(k[j]), th + 2, c, -1, cv2.LINE_AA)
+    cv2.line(img, q(hm), q(sm), bgr(TRUNK), th + 1, cv2.LINE_AA)
+    for p in (hm, sm): cv2.circle(img, q(p), th + 3, bgr(TRUNK), -1, cv2.LINE_AA)
+
+def put(img_bgr, items):
+    """items: list of (text, (x,y), size, colour). Draw with PIL for clean type."""
+    im = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)); dr = ImageDraw.Draw(im)
+    for t, xy, sz, col in items: dr.text(xy, t, font=font(sz), fill=col)
+    return cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+
+hipc = K[:, [11, 12]].mean(1)
+from scipy.ndimage import uniform_filter1d
+cx = uniform_filter1d(hipc[:, 0], 9, mode='nearest'); cy = uniform_filter1d(hipc[:, 1], 25, mode='nearest')
+span = np.nanmedian(np.nanmax(K[:, :, 1], 1) - np.nanmin(K[:, :, 1], 1))  # athlete height in px
+CS = int(np.clip(span * 1.45, 80, min(W, H)))
+spanf = uniform_filter1d(np.nan_to_num(np.nanmax(K[:, :, 1], 1) - np.nanmin(K[:, :, 1], 1), nan=span), 9, mode='nearest')
+
+def crop_box(i, size=CS, cyf=0.55):
+    x0 = int(np.clip(cx[i] - size / 2, 0, W - size)); y0 = int(np.clip(cy[i] - size * cyf, 0, H - size)); return x0, y0
+
+def encode(raw, final):
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', raw, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '20', '-movflags', '+faststart', final], check=True)
+    os.remove(raw)
+
+def angle_marker(img, base, ang, length, sc_off, col, label):
+    """Draw a dashed vertical reference at `base` (image px) and the angle label."""
+    (bx, by) = base
+    for yy in range(0, int(length), 14):
+        cv2.line(img, (bx, by - yy), (bx, by - min(yy + 8, int(length))), bgr(GREY), 2, cv2.LINE_AA)
+    return (label, (bx + 12, by - int(length) - 4))
+
+def touchdown_tiles(st, dist, w=400):
+    tiles = []
+    for s_ in st[(st.foot_pos_m > 0.3) & (st.foot_pos_m <= dist + 0.2)].itertuples():
+        i = int(s_.td_frame); size = int(CS * 0.95); x0, y0 = crop_box(i, size)
+        z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (w, w), interpolation=cv2.INTER_CUBIC)
+        draw_skel(z, K[i], w / size, (x0, y0), 2)
+        pad = np.zeros((130, w, 3), np.uint8); pad[:] = bgr(BG)
+        tiles.append(put(np.vstack([z, pad]), [(f'STEP {s_.step}  ·  {s_.foot_pos_m:.1f} m', (14, w + 10), 26, FLUORO),
+                    (f'Shin {s_.shin_TD:.0f}°   Trunk {s_.trunk_TD:.0f}°', (14, w + 50), 23, WHITE),
+                    (f'Foot {s_.foot_vs_hip_cm:+.0f} cm vs hip', (14, w + 86), 23, WHITE)]))
+    return tiles
+
+def still(i, annotate, title, lines, fname, step=None, trunk_only=False):
+    size = int(np.clip(spanf[i] * 1.6, 80, min(W, H))); x0, y0 = crop_box(i, size)
+    z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (1080, 1080), interpolation=cv2.INTER_CUBIC)
+    if annotate:
+        sc = 1080 / size; k = K[i]
+        if trunk_only:
+            qq = lambda xy: (int((xy[0] - x0) * sc), int((xy[1] - y0) * sc))
+            h_, s_ = qq((k[11] + k[12]) / 2), qq((k[5] + k[6]) / 2)
+            ext = (int(h_[0] + (s_[0] - h_[0]) * 1.25), int(h_[1] + (s_[1] - h_[1]) * 1.25))
+            cv2.line(z, h_, ext, bgr(TRUNK), 6, cv2.LINE_AA)
+            for p_ in (h_, s_): cv2.circle(z, p_, 9, bgr(TRUNK), -1, cv2.LINE_AA)
+        else:
+            draw_skel(z, k, sc, (x0, y0), 4)
+        q = lambda xy: (int((xy[0] - x0) * sc), int((xy[1] - y0) * sc))
+        labels = []
+        hm = q((k[11] + k[12]) / 2); sm = q((k[5] + k[6]) / 2)
+        labels.append(angle_marker(z, hm, None, abs(hm[1] - sm[1]), None, TRUNK, ''))
+        if step is not None:
+            an = q(k[15] if step.get('leg') == 'L' else k[16]); kn = q(k[13] if step.get('leg') == 'L' else k[14])
+            angle_marker(z, an, None, abs(an[1] - kn[1]), None, FLUORO, '')
+        bar = np.zeros((170, 1080, 3), np.uint8); bar[:] = bgr(BG)
+        z = np.vstack([z, bar])
+        items = [(title.upper(), (36, 1080 + 22), 34, FLUORO)] + [(ln, (36, 1080 + 72 + 44 * j), 30, WHITE) for j, ln in enumerate(lines)]
+        items.append(('APX PERFORMANCE LAB', (1080 - 300, 1080 + 170 - 40), 22, GREY))
+        z = put(z, items)
+    cv2.imwrite(fname, z, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if annotate:
+        json.dump({'title': title, 'lines': lines, 'frame': int(i)}, open(fname.replace('.jpg', '.json'), 'w'))
+
+if a.mode == 'accel':
+    df = pd.read_csv(f'{A}/per_frame.csv'); st = pd.read_csv(f'{A}/steps.csv'); ph = pd.read_csv(f'{A}/phases.csv')
+    summ = json.load(open(f'{A}/summary.json')); dist = 10.0
+    # which leg is planted at each touchdown (closest ankle to footprint) for drawing the shin reference
+    def planted_leg(r):
+        f = int(r.td_frame); xf = None
+        return 'L' if abs(df.loc[f, 'shin_L'] - r.shin_TD) <= abs(df.loc[f, 'shin_R'] - r.shin_TD) else 'R'
+    td = {int(r.td_frame): r for r in st.itertuples()}
+    OW, OH = 1280, 720
+    raw = f'{a.out}/_raw.mp4'; vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), 30, (OW, OH)); hold = None
+    for i in range(N):
+        cv_ = np.zeros((OH, OW, 3), np.uint8); cv_[:] = bgr(BG)
+        x0, y0 = crop_box(i); z = cv2.resize(frames[i][y0:y0 + CS, x0:x0 + CS], (OH, OH), interpolation=cv2.INTER_CUBIC)
+        if valid[i]: draw_skel(z, K[i], OH / CS, (x0, y0), 3)
+        cv_[:, :OH] = z
+        full = frames[i].copy(); cv2.rectangle(full, (x0, y0), (x0 + CS, y0 + CS), bgr(FLUORO), max(2, W // 400))
+        iw = 520; ih = int(iw * H / W); cv_[20:20 + ih, OH + 20:OH + 20 + iw] = cv2.resize(full, (iw, ih))
+        r = df.iloc[i]; X = OH + 24; Y = 20 + ih + 24; items = []
+        items.append((f'{a.name.upper()}  |  10M ACCELERATION', (X, Y), 22, FLUORO)); Y += 44
+        items.append((f'Distance   {max(r.hip_x_m, 0):4.1f} m', (X, Y), 26, WHITE)); Y += 38
+        items.append((f'Trunk lean   {r.trunk_lean_deg:3.0f}°', (X, Y), 26, TRUNK)); Y += 46
+        if i in td: hold = (td[i], 14)
+        if hold:
+            s, n = hold
+            items.append((f'TOUCHDOWN  ·  STEP {s.step}', (X, Y), 24, FLUORO)); Y += 36
+            items.append((f'Shin {s.shin_TD:.0f}°   Foot {s.foot_vs_hip_cm:+.0f} cm vs hip', (X, Y), 22, WHITE)); Y += 32
+            extra = f'Step {s.step_length_m:.2f} m' if pd.notna(s.step_length_m) else ''
+            if pd.notna(s.contact_ms): extra += f'   Contact ~{s.contact_ms:.0f} ms'
+            items.append((extra, (X, Y), 22, WHITE))
+            hold = (s, n - 1) if n > 1 else None
+        by = OH - 56; bx0, bx1 = X, OW - 36
+        cv2.line(cv_, (bx0, by), (bx1, by), bgr(GREY), 2)
+        for mm in (0, 5, 10):
+            xx = int(bx0 + (bx1 - bx0) * mm / dist); cv2.line(cv_, (xx, by - 8), (xx, by + 8), bgr(GREY), 2)
+            items.append((f'{mm}m', (xx - 12, by + 14), 16, GREY))
+        for s in st.itertuples():
+            if s.td_frame <= i and 0 <= s.foot_pos_m <= dist + 0.5:
+                cv2.circle(cv_, (int(bx0 + (bx1 - bx0) * min(s.foot_pos_m, dist) / dist), by), 6, bgr(FLUORO), -1, cv2.LINE_AA)
+        cv2.circle(cv_, (int(bx0 + (bx1 - bx0) * np.clip(r.hip_x_m, 0, dist) / dist), by - 20), 8, bgr(WHITE), -1, cv2.LINE_AA)
+        items.append(('Fluoro / white = the two legs & arms   Blue = trunk   Dots = footprints', (20, OH - 30), 15, WHITE))
+        vw.write(put(cv_, items))
+    vw.release(); encode(raw, f'{a.out}/APX_{TAG}_10m_Side_Overlay.mp4')
+
+    # touchdown reel
+    tiles = touchdown_tiles(st, dist)
+    per = 5; rows_ = []
+    for r0 in range(0, len(tiles), per):
+        row = tiles[r0:r0 + per]
+        while len(row) < per: row.append(np.full_like(tiles[0], BG[0]))
+        rows_.append(np.hstack(row))
+    head = np.zeros((90, rows_[0].shape[1], 3), np.uint8); head[:] = bgr(BG)
+    head = put(head, [(f'{a.name.upper()}  |  10M ACCELERATION  |  TOUCHDOWN REEL', (20, 26), 32, FLUORO),
+                      ('APX PERFORMANCE LAB', (rows_[0].shape[1] - 340, 32), 24, GREY)])
+    cv2.imwrite(f'{a.out}/APX_{TAG}_10m_Touchdown_Reel.jpg', np.vstack([head] + rows_), [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+    # report slot stills
+    ed = summ['slot_frames']['early_drive']
+    if ed is not None:
+        s = st[st.td_frame == ed].iloc[0]
+        lines = [f'Step {int(s.step)} at {s.foot_pos_m:.1f} m   Shin {s.shin_TD:.0f}°   Trunk {s.trunk_TD:.0f}°', f'Foot {s.foot_vs_hip_cm:+.0f} cm vs hip at touchdown']
+        for ann in (True, False):
+            still(ed, ann, 'Acceleration · Early Drive Phase', lines, f'{a.out}/APX_{TAG}_10m_Early_Drive_{"annotated" if ann else "clean"}.jpg', {'leg': planted_leg(s)})
+    pl = summ['slot_frames']['peak_lean']; r = df.iloc[pl]
+    for ann in (True, False):
+        still(pl, ann, 'Acceleration · Peak Drive Lean', [f'Trunk lean {r.trunk_lean_deg:.0f}° at {max(r.hip_x_m, 0):.1f} m'],
+              f'{a.out}/APX_{TAG}_10m_Peak_Drive_Lean_{"annotated" if ann else "clean"}.jpg', trunk_only=True)
+
+    # data workbook
+    nice = st.rename(columns={'step': 'Step', 'foot_pos_m': 'Foot lands at (m)', 'step_length_m': 'Step length (m)',
+        'trunk_TD': 'Trunk lean at touchdown (°)', 'shin_TD': 'Shin angle at touchdown (°, + = knee ahead of ankle)',
+        'shin_trunk_gap': 'Trunk minus shin (°)', 'foot_vs_hip_cm': 'Foot vs hip at touchdown (cm, + = ahead)',
+        'knee_TD': 'Knee angle at touchdown (°)', 'hip_TO': 'Hip angle at toe-off (°, approx)', 'knee_TO': 'Knee angle at toe-off (°, approx)',
+        'body_lean_TO': 'Body lean at toe-off, foot-to-hip (°)', 'peak_front_thigh': 'Peak front thigh (° from vertical, approx)',
+        'contact_ms': 'Ground contact (ms, approx)', 'flight_ms': 'Flight (ms, approx)', 'step_freq_hz': 'Step frequency (steps/s)',
+        'speed_ms': 'Speed (m/s)', 'td_frame': 'Touchdown frame', 'to_frame': 'Toe-off frame'}).drop(columns=['timing_ok', 'step_time_ms'])
+    with pd.ExcelWriter(f'{a.out}/APX_{TAG}_10m_Data.xlsx') as xw:
+        nice.to_excel(xw, sheet_name='Steps', index=False); ph.to_excel(xw, sheet_name='Phases', index=False)
+        pd.DataFrame([{'item': k, 'value': json.dumps(v) if isinstance(v, (dict, list)) else v} for k, v in summ.items()]).to_excel(xw, sheet_name='Summary', index=False)
+    import openpyxl
+    wb = openpyxl.load_workbook(f'{a.out}/APX_{TAG}_10m_Data.xlsx')
+    for ws in wb.worksheets:
+        for col in ws.iter_cols(min_row=1, max_row=1):
+            ws.column_dimensions[col[0].column_letter].width = 24
+    wb.save(f'{a.out}/APX_{TAG}_10m_Data.xlsx')
+    print('accel outputs written to', a.out)
+
+elif a.mode == 'plain':
+    OW = 1280; OH = 720
+    raw = f'{a.out}/_raw.mp4'; vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), 30, (OW, OH))
+    for i in range(N):
+        f = frames[i].copy()
+        if valid[i]: draw_skel(f, K[i], 1.0, (0, 0), max(2, W // 500))
+        s = min(OW / W, OH / H); f = cv2.resize(f, (int(W * s), int(H * s)))
+        c = np.zeros((OH, OW, 3), np.uint8); c[:] = bgr(BG); oy, ox = (OH - f.shape[0]) // 2, (OW - f.shape[1]) // 2
+        c[oy:oy + f.shape[0], ox:ox + f.shape[1]] = f
+        vw.write(put(c, [(f'{a.name.upper()}  |  {a.label.upper()}', (20, 16), 22, FLUORO)]))
+    vw.release(); encode(raw, f'{a.out}/APX_{TAG}_{a.label.replace(" ", "_")}_Overlay.mp4')
+    # candidate stills: athlete big enough, fully in frame, two legs tracked separately
+    good = []
+    for i in range(N):
+        if not valid[i]: continue
+        k = K[i]; h = spanf[i]
+        if np.nanmin(k[:, 1]) < 0.01 * H or np.nanmax(k[:, 1]) > 0.99 * H or np.nanmin(k[:, 0]) < 0.01 * W or np.nanmax(k[:, 0]) > 0.99 * W: continue
+        if h < 0.45 * np.nanmax(spanf): continue
+        if np.linalg.norm(k[13] - k[14]) < 0.06 * h and np.linalg.norm(k[15] - k[16]) < 0.06 * h: continue  # both legs on one leg
+        good.append(i)
+    picks = [good[j] for j in np.linspace(0, len(good) - 1, min(12, len(good))).astype(int)] if good else list(np.linspace(0, N - 1, 12).astype(int))
+    tiles = []
+    for i in picks:
+        size = int(np.clip(spanf[i] * 1.5, 80, min(W, H))); x0, y0 = crop_box(i, size)
+        z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (320, 320))
+        if valid[i]: draw_skel(z, K[i], 320 / size, (x0, y0), 2)
+        tiles.append(put(z, [(f'frame {i}', (8, 6), 18, FLUORO)]))
+    while len(tiles) < 12: tiles.append(np.zeros_like(tiles[0]))
+    cv2.imwrite(f'{a.work}/pick_frames.jpg', np.vstack([np.hstack(tiles[r:r + 6]) for r in (0, 6)]))
+    print(f'{len(good)} usable frames for a still (athlete big enough, in frame, legs tracked separately)')
+    print('plain overlay written; choose a still from', f'{a.work}/pick_frames.jpg')
+
+elif a.mode == 'still':
+    for ann in (True, False):
+        still(a.frame, ann, a.slot, [a.caption] if a.caption else [], trunk_only=a.trunk_only, fname= f'{a.out}/APX_{TAG}_{a.slot.replace(" ", "_").replace("·", "").replace("__", "_")}_{"annotated" if ann else "clean"}.jpg')
+    print('still written')
+
+elif a.mode == 'reel':
+    # One report image per pillar: key stills (with captions) on top, every touchdown below.
+    RW = 1600; st = pd.read_csv(f'{A}/steps.csv')
+    def bar(h, items):
+        b = np.zeros((h, RW, 3), np.uint8); b[:] = bgr(BG); return put(b, items)
+    parts = [bar(84, [(f'{a.name.upper()}  |  {a.test.upper()}', (24, 22), 34, FLUORO), ('APX PERFORMANCE LAB', (RW - 330, 30), 24, GREY)])]
+    keys = []
+    for pth in a.stills:
+        img = cv2.imread(pth)
+        if img is None: print('WARNING: still not found, skipped:', pth); continue
+        if os.path.exists(pth.replace('.jpg', '.json')): meta_ = json.load(open(pth.replace('.jpg', '.json')))
+        else:
+            print('WARNING: caption file missing for', pth, '(do not delete the .json files before building the reel). Using the file name.')
+            meta_ = {'title': os.path.basename(pth).replace('_annotated.jpg', '').split('_10m_')[-1].replace('_', ' '), 'lines': []}
+        kw = RW // 3; im = cv2.resize(img[:1080], (kw, kw), interpolation=cv2.INTER_AREA)
+        cap_ = np.zeros((120, kw, 3), np.uint8); cap_[:] = bgr(BG)
+        items = [(meta_['title'].split('·')[-1].strip().upper(), (14, 10), 24, FLUORO)] + [(ln, (14, 46 + 34 * j), 19, WHITE) for j, ln in enumerate(meta_['lines'][:2])]
+        keys.append(np.vstack([im, put(cap_, items)]))
+    if keys:
+        parts.append(bar(50, [('KEY POSITIONS', (24, 12), 24, GREY)]))
+        row = np.zeros((keys[0].shape[0], RW, 3), np.uint8); row[:] = bgr(BG)
+        x = (RW - len(keys) * (RW // 3)) // 2
+        for k_ in keys: row[:, x:x + k_.shape[1]] = k_; x += k_.shape[1]
+        parts.append(row)
+    tiles = touchdown_tiles(st, 10.0)
+    if tiles:
+        parts.append(bar(50, [('EVERY TOUCHDOWN  (side-on, measured at foot contact)', (24, 12), 24, GREY)]))
+        for r0 in range(0, len(tiles), 4):
+            row = tiles[r0:r0 + 4]
+            while len(row) < 4: row.append(np.full_like(tiles[0], BG[0]))
+            parts.append(np.hstack(row))
+    parts.append(bar(46, [('Fluoro / white = the two legs and arms   Blue = trunk   Shin: + = knee ahead of ankle   Foot vs hip: + = foot lands ahead', (24, 12), 18, GREY)]))
+    out = f'{a.out}/APX_{TAG}_{a.test.split()[0]}_Report_Reel.jpg'
+    cv2.imwrite(out, np.vstack(parts), [cv2.IMWRITE_JPEG_QUALITY, 88])
+    print('reel written', out, np.vstack(parts).shape)
+
+elif a.mode == 'video':
+    # One compressed video per pillar for embedding in the HTML report: clips played back to back.
+    lst = f'{a.out}/_concat.txt'
+    open(lst, 'w').write(''.join(f"file '{os.path.abspath(p)}'\n" for p in a.inputs))
+    out = f'{a.out}/APX_{TAG}_{a.test.split()[0]}_Report_Video.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-vf', 'scale=1280:720,fps=30',
+                    '-c:v', 'libx264', '-preset', 'slow', '-crf', '30', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', out], check=True)
+    os.remove(lst)
+    print('report video written', out, round(os.path.getsize(out) / 1e6, 2), 'MB')
