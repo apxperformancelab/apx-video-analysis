@@ -1,7 +1,7 @@
 # APX Performance Lab: video analysis pipeline
 
 Pose tracking and sprint / change-of-direction analysis used by the APX Video Analysis projects.
-Runs on onnxruntime (CPU), no torch. Models: YOLO11 detection + pose (Ultralytics, AGPL-3.0), exported to ONNX, published as release assets.
+Runs on onnxruntime (CPU), no torch. Models: YOLO11 detection + pose (Ultralytics, AGPL-3.0), exported to ONNX, stored on the `models` branch.
 
 Setup in a fresh environment:
 
