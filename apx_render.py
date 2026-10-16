@@ -313,11 +313,11 @@ elif a.mode == 'cod':
         if pd.notna(getattr(s_, 'trunk_deepest', np.nan)): L2.append(f'Trunk {s_.trunk_deepest:.0f}°')
         if pd.notna(getattr(s_, 'trunk_side_lean_deg', np.nan)): L2.append(f'Side lean {s_.trunk_side_lean_deg:.0f}°')
         if pd.notna(s_.contact_ms): L2.append(f'Contact ~{s_.contact_ms:.0f} ms')
-        if not L1: L1 = [f'Body {s_.body_to_camera} to this camera: angles not measured']
+        if not L1: L1 = [f'Body {s_.body_to_camera} to camera: no angles']
         return ['   '.join(L1), '   '.join(L2) if L2 else 'Approx values, coach to confirm on video', f'Approx. Drawn: stance leg ({s_.leg_tracked}) and trunk. Knee line + = inward']
     side_word = a.test.split()[-1]
     for nm, sel_, ttl in ((('Penultimate_Step', pn, 'Penultimate Step'), ('Plant', pl, 'Plant (deepest point)')) if view == 'side' else
-                          (('Front_Penultimate', pn, 'Front-On Penultimate Step'), ('Front_Plant', pl, 'Front-On Plant'))):
+                          (('Front_Penultimate', pn, 'Front-On Penultimate'), ('Front_Plant', pl, 'Front-On Plant'))):
         if not len(sel_): print('WARNING: no', nm, 'contact found; still skipped'); continue
         s_ = sel_.iloc[0]
         for ann in (True, False):

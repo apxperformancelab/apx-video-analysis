@@ -215,6 +215,8 @@ for k, c in enumerate(contacts):
     td, to = c['frames'][0], c['frames'][-1]; gy = float(np.median([Ps[f, 15 + j, 1] for f, j in zip(c['frames'], c['js'])]))
     leg = stance_leg(c); hp, kn, an = SIDE_J[leg]
     stance = range(td, to + 1)
+    if roles[k] == 'penultimate' and to >= ptd:      # penultimate foot stays down through the plant: measure it before the plant lands
+        stance = range(td, max(td + 1, ptd))
     knees = [df.at[f, f'knee_{leg}'] for f in stance]; hh = [hip_height(f, gy) for f in stance]
     fdeep = td + int(np.argmin(hh))      # deepest point = lowest hip
     facing = float(np.median(df.loc[td:to, 'hip_width_pctL']))
@@ -241,6 +243,8 @@ for k, c in enumerate(contacts):
         fppa = float(np.degrees(np.arctan2(abs(v1[0] * v2[1] - v1[1] * v2[0]), np.dot(v1, v2))))
         row['knee_inward_pctL'] = round(off / LPX[fdeep] * 100, 1)
         row['knee_line_deg'] = round(fppa * (1 if off > 0 else -1), 1)
+        if fppa > 45:   # a big bend in the image here is knee flexion seen end-on (thigh towards the camera), not the knee moving in or out
+            row['knee_inward_pctL'] = row['knee_line_deg'] = np.nan
         side_sign = 1 if (Ps[fdeep, an, 0] - hip[fdeep, 0]) > 0 else -1     # + = trunk leans over the stance foot
         row['trunk_side_lean_deg'] = round(float(np.degrees(np.arctan2((sho[fdeep, 0] - hip[fdeep, 0]) * side_sign, hip[fdeep, 1] - sho[fdeep, 1]))), 1)
         row['foot_width_pctL'] = round(float(abs(c['xy'][0] - hip[td, 0]) / LPX[td] * 100), 1)
