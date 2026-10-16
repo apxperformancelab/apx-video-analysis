@@ -18,14 +18,14 @@ warnings.filterwarnings('ignore')
 from PIL import Image, ImageDraw, ImageFont
 
 ap = argparse.ArgumentParser()
-ap.add_argument('mode', choices=['accel', 'maxv', 'plain', 'still', 'reel', 'video'])
+ap.add_argument('mode', choices=['accel', 'maxv', 'cod', 'plain', 'still', 'reel', 'video'])
 ap.add_argument('--work', required=True); ap.add_argument('--name', required=True); ap.add_argument('--out', required=True)
 ap.add_argument('--label', default='10m Front'); ap.add_argument('--frame', type=int); ap.add_argument('--slot', default='Still'); ap.add_argument('--caption', default=''); ap.add_argument('--trunk-only', action='store_true')
 ap.add_argument('--stills', nargs='*', default=[]); ap.add_argument('--inputs', nargs='*', default=[]); ap.add_argument('--test', default=None); ap.add_argument('--dist', type=float, default=None)
 a = ap.parse_args()
-if a.test is None: a.test = '30m Max Velocity' if a.mode == 'maxv' else '10m Acceleration'
+if a.test is None: a.test = {'maxv': '30m Max Velocity', 'cod': '505'}.get(a.mode, '10m Acceleration')
 if a.dist is None: a.dist = 30.0 if (a.mode == 'maxv' or a.test.startswith('30')) else 10.0
-TESTTAG = a.test.split()[0]
+TESTTAG = a.test.replace(' Max Velocity', '').replace(' Acceleration', '').replace(' ', '_')
 os.makedirs(a.out, exist_ok=True)
 TAG = a.name.strip().replace(' ', '_')
 
@@ -112,7 +112,22 @@ def touchdown_tiles(st, dist, w=400):
                     (f'Shin {s_.shin_TD:.0f}°   Trunk {s_.trunk_TD:.0f}°', (14, w + 50), 23, WHITE), (fv, (14, w + 86), 23, WHITE)]))
     return tiles
 
-def still(i, annotate, title, lines, fname, step=None, trunk_only=False, only_leg=None):
+def cod_tiles(st, w=400):
+    tiles = []
+    ap_ = st[st.role == 'approach'].tail(2)
+    st = pd.concat([ap_, st[st.role.isin(['penultimate', 'plant', 'second foot (turn)', 'first step out'])]])
+    for s_ in st.itertuples():
+        i = int(s_.deepest_frame); size = int(CS * 0.95); x0, y0 = crop_box(i, size)
+        z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (w, w), interpolation=cv2.INTER_CUBIC)
+        draw_skel(z, K[i], w / size, (x0, y0), 2)
+        pad = np.zeros((130, w, 3), np.uint8); pad[:] = bgr(BG)
+        l2 = f'Hip height {s_.hip_height_min_pctL:.0f}% leg' + (f'   ~{s_.contact_ms:.0f} ms' if pd.notna(s_.contact_ms) else '')
+        l3 = '   '.join(([f'Knee bend {s_.knee_flex_max:.0f}°'] if pd.notna(s_.knee_flex_max) else []) + ([f'Trunk {s_.trunk_deepest:.0f}°'] if pd.notna(getattr(s_, 'trunk_deepest', np.nan)) else [])
+                       + ([f'Knee line {s_.knee_line_deg:+.0f}°'] if pd.notna(getattr(s_, 'knee_line_deg', np.nan)) else [])) or f'Body {s_.body_to_camera}'
+        tiles.append(put(np.vstack([z, pad]), [(f'{s_.role.upper()}', (14, w + 10), 26, FLUORO), (l2, (14, w + 50), 23, WHITE), (l3, (14, w + 86), 23, WHITE)]))
+    return tiles
+
+def still(i, annotate, title, lines, fname, step=None, trunk_only=False, only_leg=None, knee_line=None):
     size = int(np.clip(spanf[i] * 1.6, 80, min(W, H))); x0, y0 = crop_box(i, size)
     z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (1080, 1080), interpolation=cv2.INTER_CUBIC)
     if annotate:
@@ -132,16 +147,21 @@ def still(i, annotate, title, lines, fname, step=None, trunk_only=False, only_le
         else:
             draw_skel(z, k, sc, (x0, y0), 4)
         q = lambda xy: (int((xy[0] - x0) * sc), int((xy[1] - y0) * sc))
+        if knee_line is not None:   # front view: dashed hip-to-ankle line and the knee, to show knee in/out
+            hp_, kn_, an_ = (11, 13, 15) if knee_line == 'L' else (12, 14, 16)
+            p0, p1 = np.array(q(k[hp_]), float), np.array(q(k[an_]), float); L_ = np.linalg.norm(p1 - p0)
+            for t0 in np.arange(0, 1, 0.08): cv2.line(z, tuple((p0 + (p1 - p0) * t0).astype(int)), tuple((p0 + (p1 - p0) * min(t0 + 0.05, 1)).astype(int)), bgr(TRUNK), 4, cv2.LINE_AA)
+            cv2.circle(z, q(k[kn_]), 14, bgr(FLUORO), 3, cv2.LINE_AA)
         labels = []
         hm = q((k[11] + k[12]) / 2); sm = q((k[5] + k[6]) / 2)
-        labels.append(angle_marker(z, hm, None, abs(hm[1] - sm[1]), None, TRUNK, ''))
+        if knee_line is None: labels.append(angle_marker(z, hm, None, abs(hm[1] - sm[1]), None, TRUNK, ''))
         if step is not None:
             an = q(k[15] if step.get('leg') == 'L' else k[16]); kn = q(k[13] if step.get('leg') == 'L' else k[14])
             angle_marker(z, an, None, abs(an[1] - kn[1]), None, FLUORO, '')
-        bar = np.zeros((170, 1080, 3), np.uint8); bar[:] = bgr(BG)
+        bar = np.zeros((170 + (40 if len(lines) > 2 else 0), 1080, 3), np.uint8); bar[:] = bgr(BG)
         z = np.vstack([z, bar])
-        items = [(title.upper(), (36, 1080 + 22), 34, FLUORO)] + [(ln, (36, 1080 + 72 + 44 * j), 30, WHITE) for j, ln in enumerate(lines)]
-        items.append(('APX PERFORMANCE LAB', (1080 - 300, 1080 + 170 - 40), 22, GREY))
+        items = [(title.upper(), (36, 1080 + 22), 34, FLUORO)] + [(ln, (36, 1080 + 72 + 44 * j), 30 if j < 2 else 22, WHITE if j < 2 else GREY) for j, ln in enumerate(lines)]
+        items.append(('APX PERFORMANCE LAB', (1080 - 330, 1080 + 30), 22, GREY))
         z = put(z, items)
     cv2.imwrite(fname, z, [cv2.IMWRITE_JPEG_QUALITY, 92])
     if annotate:
@@ -255,6 +275,77 @@ if a.mode in ('accel', 'maxv'):
     wb.save(f'{a.out}/APX_{TAG}_{TESTTAG}_Data.xlsx')
     print('accel outputs written to', a.out)
 
+elif a.mode == 'cod':
+    df = pd.read_csv(f'{A}/per_frame.csv'); st = pd.read_csv(f'{A}/steps.csv'); summ = json.load(open(f'{A}/summary.json'))
+    view = summ['view']; VW = 'Side' if view == 'side' else 'Front'; plant_leg = summ['turn']['plant_leg_given']
+    hold_at = {int(r.td_frame): r for r in st.itertuples()}
+    OW, OH = 1280, 720; raw = f'{a.out}/_raw.mp4'; vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), 30, (OW, OH)); hold = None
+    sc_in = min(520 / W, 330 / H); iw, ih = int(W * sc_in), int(H * sc_in)
+    for i in range(N):
+        cv_ = np.zeros((OH, OW, 3), np.uint8); cv_[:] = bgr(BG)
+        x0, y0 = crop_box(i); z = cv2.resize(frames[i][y0:y0 + CS, x0:x0 + CS], (OH, OH), interpolation=cv2.INTER_CUBIC)
+        if valid[i]: draw_skel(z, K[i], OH / CS, (x0, y0), 3)
+        cv_[:, :OH] = z
+        full = frames[i].copy(); cv2.rectangle(full, (x0, y0), (x0 + CS, y0 + CS), bgr(FLUORO), max(2, W // 300))
+        cv_[20:20 + ih, OH + 20:OH + 20 + iw] = cv2.resize(full, (iw, ih))
+        r = df.iloc[i]; X = OH + 24; Y = 20 + ih + 24; items = [(f'{a.name.upper()}  |  {a.test.upper()}', (X, Y), 22, FLUORO)]; Y += 44
+        if view == 'side': items.append((f'Trunk lean   {r.trunk_lean_deg:3.0f}°', (X, Y), 26, TRUNK))
+        Y += 44
+        if i in hold_at: hold = (hold_at[i], 18)
+        if hold:
+            s_, n = hold
+            items.append((f'{s_.role.upper()}', (X, Y), 26, FLUORO)); Y += 38
+            l1 = (f'Hip height {s_.hip_height_min_pctL:.0f}% leg' if view == 'side' else '') + (f'   Knee bend {s_.knee_flex_max:.0f}°' if pd.notna(s_.knee_flex_max) else '')
+            items.append((l1, (X, Y), 21, WHITE)); Y += 32
+            if pd.notna(getattr(s_, 'knee_line_deg', np.nan)):
+                items.append((f'Knee line {s_.knee_line_deg:+.0f}° (+ = inward, approx)', (X, Y), 21, WHITE)); Y += 32
+            if pd.notna(s_.contact_ms): items.append((f'Contact ~{s_.contact_ms:.0f} ms', (X, Y), 21, WHITE))
+            hold = (s_, n - 1) if n > 1 else None
+        items.append(('Fluoro / white = the two legs & arms   Blue = trunk', (20, OH - 30), 15, WHITE))
+        vw.write(put(cv_, items))
+    vw.release(); encode(raw, f'{a.out}/APX_{TAG}_{TESTTAG}_{VW}_Overlay.mp4')
+    pl = st[st.role == 'plant']; pn = st[st.role == 'penultimate']
+    def cod_lines(s_):
+        L1, L2 = [], []
+        if view == 'side': L1.append(f'Hip height {s_.hip_height_min_pctL:.0f}% of leg')
+        if pd.notna(s_.knee_flex_max): L1.append(f'Knee bend {s_.knee_flex_max:.0f}°')
+        if pd.notna(getattr(s_, 'knee_line_deg', np.nan)): L1.append(f'Knee line {s_.knee_line_deg:+.0f}°')
+        if pd.notna(getattr(s_, 'trunk_deepest', np.nan)): L2.append(f'Trunk {s_.trunk_deepest:.0f}°')
+        if pd.notna(getattr(s_, 'trunk_side_lean_deg', np.nan)): L2.append(f'Side lean {s_.trunk_side_lean_deg:.0f}°')
+        if pd.notna(s_.contact_ms): L2.append(f'Contact ~{s_.contact_ms:.0f} ms')
+        if not L1: L1 = [f'Body {s_.body_to_camera} to this camera: angles not measured']
+        return ['   '.join(L1), '   '.join(L2) if L2 else 'Approx values, coach to confirm on video', f'Approx. Drawn: stance leg ({s_.leg_tracked}) and trunk. Knee line + = inward']
+    side_word = a.test.split()[-1]
+    for nm, sel_, ttl in ((('Penultimate_Step', pn, 'Penultimate Step'), ('Plant', pl, 'Plant (deepest point)')) if view == 'side' else
+                          (('Front_Penultimate', pn, 'Front-On Penultimate Step'), ('Front_Plant', pl, 'Front-On Plant'))):
+        if not len(sel_): print('WARNING: no', nm, 'contact found; still skipped'); continue
+        s_ = sel_.iloc[0]
+        for ann in (True, False):
+            still(int(s_.deepest_frame), ann, f'505 {side_word} · {ttl}', cod_lines(s_), f'{a.out}/APX_{TAG}_{TESTTAG}_{nm}_{"annotated" if ann else "clean"}.jpg',
+                  knee_line=(s_.leg_tracked if pd.notna(getattr(s_, 'knee_line_deg', np.nan)) else None), only_leg=s_.leg_tracked)
+    nice = st.rename(columns={'contact': 'Contact', 'role': 'Role', 'td_frame': 'Touchdown frame', 'to_frame': 'Toe-off frame', 'deepest_frame': 'Deepest frame',
+        'leg_tracked': 'Leg (pose model, check)', 'contact_ms': 'Ground contact (ms, approx)', 'hip_height_TD_pctL': 'Hip height at touchdown (% leg)',
+        'hip_height_min_pctL': 'Lowest hip height (% leg)', 'knee_TD': 'Knee angle at touchdown (°)', 'knee_flex_max': 'Max knee bend (°)',
+        'foot_vs_hip_pctL': 'Foot vs hip at touchdown (% leg, + = ahead)', 'shin_TD': 'Shin at touchdown (°, + = knee ahead of ankle)',
+        'trunk_TD': 'Trunk at touchdown (°, + = forward)', 'trunk_deepest': 'Trunk at deepest point (°)', 'step_length_legs': 'Step length (leg lengths)',
+        'facing_camera_pctL': 'Hip width in view (% leg; low = side-on)', 'knee_inward_pctL': 'Knee inside hip-ankle line (% leg)',
+        'knee_line_deg': 'Knee line (°, + = inward, approx)', 'trunk_side_lean_deg': 'Trunk side lean (°)', 'foot_width_pctL': 'Foot out from hip (% leg)',
+        'measurable': 'Knee line measurable'}).drop(columns=['timing_ok'], errors='ignore')
+    xl = f'{a.out}/APX_{TAG}_{TESTTAG}_{VW}_Data.xlsx'
+    with pd.ExcelWriter(xl) as xw:
+        nice.to_excel(xw, sheet_name='Contacts', index=False)
+        flat = []
+        def walk(pre, v):
+            if isinstance(v, dict):
+                for k_, v_ in v.items(): walk(f'{pre}.{k_}' if pre else k_, v_)
+            else: flat.append({'item': pre, 'value': json.dumps(v) if isinstance(v, list) else v})
+        walk('', summ); pd.DataFrame(flat).to_excel(xw, sheet_name='Summary', index=False)
+    import openpyxl
+    wb = openpyxl.load_workbook(xl)
+    for ws in wb.worksheets:
+        for col in ws.iter_cols(min_row=1, max_row=1): ws.column_dimensions[col[0].column_letter].width = 26
+    wb.save(xl); print('505 outputs written to', a.out)
+
 elif a.mode == 'plain':
     OW = 1280; OH = 720
     raw = f'{a.out}/_raw.mp4'; vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), 30, (OW, OH))
@@ -316,23 +407,25 @@ elif a.mode == 'reel':
         x = (RW - len(keys) * (RW // 3)) // 2
         for k_ in keys: row[:, x:x + k_.shape[1]] = k_; x += k_.shape[1]
         parts.append(row)
-    tiles = touchdown_tiles(st, a.dist)
+    tiles = cod_tiles(st) if 'role' in st else touchdown_tiles(st, a.dist)
     if tiles:
-        parts.append(bar(50, [('EVERY TOUCHDOWN  (side-on, measured at foot contact)', (24, 12), 24, GREY)]))
+        parts.append(bar(50, [('FOOT CONTACTS INTO AND OUT OF THE TURN  (deepest point of each contact)' if 'role' in st else 'EVERY TOUCHDOWN  (side-on, measured at foot contact)', (24, 12), 24, GREY)]))
         for r0 in range(0, len(tiles), 4):
             row = tiles[r0:r0 + 4]
             while len(row) < 4: row.append(np.full_like(tiles[0], BG[0]))
             parts.append(np.hstack(row))
-    parts.append(bar(46, [('Fluoro / white = the two legs and arms   Blue = trunk   Shin: + = knee ahead of ankle   Foot vs hip: + = foot lands ahead', (24, 12), 18, GREY)]))
-    out = f'{a.out}/APX_{TAG}_{a.test.split()[0]}_Report_Reel.jpg'
+    parts.append(bar(46, [(('Blue = trunk   Hip height = hip above the foot, % of leg length   Knee line: + = knee inside the hip-ankle line   All approx' if 'role' in st else 'Fluoro / white = the two legs and arms   Blue = trunk   Shin: + = knee ahead of ankle   Foot vs hip: + = foot lands ahead'), (24, 12), 18, GREY)]))
+    out = f'{a.out}/APX_{TAG}_{TESTTAG}_Report_Reel.jpg'
     cv2.imwrite(out, np.vstack(parts), [cv2.IMWRITE_JPEG_QUALITY, 88])
     print('reel written', out, np.vstack(parts).shape)
 
 elif a.mode == 'video':
     # One compressed video per pillar for embedding in the HTML report: clips played back to back.
+    miss = [p_ for p_ in a.inputs if not os.path.exists(p_)]
+    if miss: print('WARNING: input not found, skipped:', miss); a.inputs = [p_ for p_ in a.inputs if os.path.exists(p_)]
     lst = f'{a.out}/_concat.txt'
     open(lst, 'w').write(''.join(f"file '{os.path.abspath(p)}'\n" for p in a.inputs))
-    out = f'{a.out}/APX_{TAG}_{a.test.split()[0]}_Report_Video.mp4'
+    out = f'{a.out}/APX_{TAG}_{TESTTAG}_Report_Video.mp4'
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-vf', 'scale=1280:720,fps=30',
                     '-c:v', 'libx264', '-preset', 'slow', '-crf', '30', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', out], check=True)
     os.remove(lst)
