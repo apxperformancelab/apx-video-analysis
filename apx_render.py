@@ -384,40 +384,57 @@ elif a.mode == 'still':
     print('still written')
 
 elif a.mode == 'reel':
-    # One report image per pillar: key stills (with captions) on top, every touchdown below.
-    RW = 1600; st = pd.read_csv(f'{A}/steps.csv')
-    def bar(h, items):
-        b = np.zeros((h, RW, 3), np.uint8); b[:] = bgr(BG); return put(b, items)
-    parts = [bar(84, [(f'{a.name.upper()}  |  {a.test.upper()}', (24, 22), 34, FLUORO), ('APX PERFORMANCE LAB', (RW - 330, 30), 24, GREY)])]
-    keys = []
+    # One landscape (16:9) report image per pillar slot, to sit beside the 16:9 video:
+    # key stills first (fluoro outline), then every touchdown / contact, all as equal cards in one grid.
+    RW, RH = 2400, 1350; st = pd.read_csv(f'{A}/steps.csv')
+    def bar(w, h, items):
+        b = np.zeros((h, w, 3), np.uint8); b[:] = bgr(BG); return put(b, items)
+    cards = []
     for pth in a.stills:
         img = cv2.imread(pth)
         if img is None: print('WARNING: still not found, skipped:', pth); continue
         if os.path.exists(pth.replace('.jpg', '.json')): meta_ = json.load(open(pth.replace('.jpg', '.json')))
         else:
             print('WARNING: caption file missing for', pth, '(do not delete the .json files before building the reel). Using the file name.')
-            meta_ = {'title': os.path.basename(pth).replace('_annotated.jpg', '').split('_10m_')[-1].replace('_', ' '), 'lines': []}
-        kw = RW // 3; im = cv2.resize(img[:1080], (kw, kw), interpolation=cv2.INTER_AREA)
-        cap_ = np.zeros((120, kw, 3), np.uint8); cap_[:] = bgr(BG)
-        items = [(meta_['title'].split('·')[-1].strip().upper(), (14, 10), 24, FLUORO)] + [(ln, (14, 46 + 34 * j), 19, WHITE) for j, ln in enumerate(meta_['lines'][:2])]
-        keys.append(np.vstack([im, put(cap_, items)]))
-    if keys:
-        parts.append(bar(50, [('KEY POSITIONS', (24, 12), 24, GREY)]))
-        row = np.zeros((keys[0].shape[0], RW, 3), np.uint8); row[:] = bgr(BG)
-        x = (RW - len(keys) * (RW // 3)) // 2
-        for k_ in keys: row[:, x:x + k_.shape[1]] = k_; x += k_.shape[1]
-        parts.append(row)
-    tiles = cod_tiles(st) if 'role' in st else touchdown_tiles(st, a.dist)
-    if tiles:
-        parts.append(bar(50, [('FOOT CONTACTS INTO AND OUT OF THE TURN  (deepest point of each contact)' if 'role' in st else 'EVERY TOUCHDOWN  (side-on, measured at foot contact)', (24, 12), 24, GREY)]))
-        for r0 in range(0, len(tiles), 4):
-            row = tiles[r0:r0 + 4]
-            while len(row) < 4: row.append(np.full_like(tiles[0], BG[0]))
-            parts.append(np.hstack(row))
-    parts.append(bar(46, [(('Blue = trunk   Hip height = hip above the foot, % of leg length   Knee line: + = knee inside the hip-ankle line   All approx' if 'role' in st else 'Fluoro / white = the two legs and arms   Blue = trunk   Shin: + = knee ahead of ankle   Foot vs hip: + = foot lands ahead'), (24, 12), 18, GREY)]))
+            meta_ = {'title': os.path.basename(pth).replace('_annotated.jpg', '').replace('_', ' '), 'lines': []}
+        im = cv2.resize(img[:1080], (400, 400), interpolation=cv2.INTER_AREA)
+        cv2.rectangle(im, (0, 0), (399, 399), bgr(FLUORO), 6)
+        cap_ = np.zeros((130, 400, 3), np.uint8); cap_[:] = bgr(BG)
+        def fit(t, sz, w=372):
+            while sz > 12 and font(sz).getlength(t) > w: sz -= 1
+            return sz
+        ttl = meta_['title'].split('·')[-1].strip().upper()
+        items = [(ttl, (14, 400 + 10), fit(ttl, 24), FLUORO)] + [(ln, (14, 400 + 50 + 36 * j), fit(ln, 21), WHITE) for j, ln in enumerate(meta_['lines'][:2])]
+        cards.append(put(np.vstack([im, cap_]), items))
+    n_key = len(cards)
+    if 'role' in st and n_key:   # 505: the penultimate and plant are already key stills
+        st = st[~st.role.isin(['penultimate', 'plant'])]
+    cards += cod_tiles(st) if 'role' in st else touchdown_tiles(st, a.dist)
+    if not cards: raise SystemExit('Nothing to put in the reel.')
+    HEAD, FOOT, GAP = 90, 50, 12
+    cw, ch = cards[0].shape[1], cards[0].shape[0]
+    # choose the column count whose grid fills the 16:9 area best
+    best = None
+    for r0 in range(1, len(cards) + 1):          # balanced rows: c = cards per row for r0 rows
+        c = -(-len(cards) // r0); r_ = -(-len(cards) // c); gw, gh = c * cw + (c - 1) * GAP, r_ * ch + (r_ - 1) * GAP
+        sc_ = min(RW / gw, (RH - HEAD - FOOT) / gh)
+        if best is None or sc_ * sc_ * gw * gh > best[0]: best = (sc_ * sc_ * gw * gh, c, r_, sc_, gw, gh)
+    _, c, r_, sc_, gw, gh = best
+    grid = np.zeros((gh, gw, 3), np.uint8); grid[:] = bgr(BG)
+    for k, cd in enumerate(cards):
+        y, x = (k // c) * (ch + GAP), (k % c) * (cw + GAP); grid[y:y + ch, x:x + cw] = cd
+    grid = cv2.resize(grid, (int(gw * sc_), int(gh * sc_)), interpolation=cv2.INTER_AREA if sc_ < 1 else cv2.INTER_CUBIC)
+    canvas = np.zeros((RH, RW, 3), np.uint8); canvas[:] = bgr(BG)
+    oy = HEAD + (RH - HEAD - FOOT - grid.shape[0]) // 2; ox = (RW - grid.shape[1]) // 2
+    canvas[oy:oy + grid.shape[0], ox:ox + grid.shape[1]] = grid
+    sub = ('Key positions (outlined), then every foot contact into and out of the turn' if 'role' in st else 'Key positions (outlined), then every touchdown, side-on, measured at foot contact')
+    canvas = put(canvas, [(f'{a.name.upper()}  |  {a.test.upper()}', (30, 22), 40, FLUORO), (sub, (30 + 26 * len(f'{a.name}  |  {a.test}') + 40, 34), 22, GREY),
+                          ('APX PERFORMANCE LAB', (RW - 340, 30), 24, GREY),
+                          (('Blue = trunk   Hip height = hip above the foot, % of leg length   Knee line: + = knee inside the hip-ankle line   All approx' if 'role' in st else
+                            'Fluoro / white = the two legs and arms   Blue = trunk   Shin: + = knee ahead of ankle   Foot vs hip: + = foot lands ahead'), (30, RH - 38), 20, GREY)])
     out = f'{a.out}/APX_{TAG}_{TESTTAG}_Report_Reel.jpg'
-    cv2.imwrite(out, np.vstack(parts), [cv2.IMWRITE_JPEG_QUALITY, 88])
-    print('reel written', out, np.vstack(parts).shape)
+    cv2.imwrite(out, canvas, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    print('reel written', out, canvas.shape, f'({n_key} key stills, {len(cards) - n_key} contacts, {c} columns)')
 
 elif a.mode == 'video':
     # One compressed video per pillar for embedding in the HTML report: clips played back to back.
