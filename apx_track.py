@@ -23,6 +23,7 @@ ap.add_argument('--view', choices=['side', 'front', 'wide'], default='side')
 ap.add_argument('--gate-time', type=float); ap.add_argument('--gate-dist', type=float, default=10)
 ap.add_argument('--det-every', type=int, default=3, help='run person detection every Nth processed frame')
 ap.add_argument('--models', default=os.path.expanduser('~/apx/models'))
+ap.add_argument('--reuse-detections', action='store_true', help='reuse WORKDIR/detections.json from an earlier run (skips the slow detection pass)')
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True); t0 = time.time()
 
@@ -69,8 +70,12 @@ def iou(p, q):
     return inter / ((p[2] - p[0]) * (p[3] - p[1]) + (q[2] - q[0]) * (q[3] - q[1]) - inter + 1e-9)
 dframes = list(range(0, N, a.det_every)) + ([N - 1] if (N - 1) % a.det_every else [])
 tracks = []  # list of dict frame->box
+all_dets = {}
+prev_dets = json.load(open(f'{a.out}/detections.json')) if a.reuse_detections and os.path.exists(f'{a.out}/detections.json') else None
 for n, k in enumerate(dframes):
-    boxes, _ = det.persons(frames[k])
+    if prev_dets is not None and str(k) in prev_dets: boxes = np.array(prev_dets[str(k)]).reshape(-1, 4)
+    else: boxes, _ = det.persons(frames[k])
+    all_dets[k] = boxes.tolist()
     used = set()
     for b in boxes:
         best, bs = None, 0
@@ -87,9 +92,35 @@ for n, k in enumerate(dframes):
             tracks.append({k: b.tolist()}); used.add(len(tracks) - 1)
     if n % 20 == 0: print(f'  detect {k}/{N}', flush=True)
 if not tracks: raise SystemExit('No person detected. Check the clip.')
+Sm = np.array(mats)
+def cen_ref(k, b):  # box centre in frame-0 (pan-corrected) coordinates
+    c = np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2, 1.0]); return (Sm[k] @ c)[:2]
+# merge fragments of the same person (detector drop-outs, occlusion, camera pan)
+merged = True
+while merged:
+    merged = False
+    tracks.sort(key=lambda t: min(t))
+    for ia in range(len(tracks)):
+        A = tracks[ia]; ea = max(A); ca = cen_ref(ea, A[ea]); ha = A[ea][3] - A[ea][1]
+        best, bd = None, 1e9
+        for ib in range(len(tracks)):
+            if ib == ia: continue
+            B = tracks[ib]; sb = min(B)
+            if not (-4 * a.det_every <= sb - ea <= 12 * a.det_every) or max(B) <= ea: continue
+            if sb <= ea:   # small overlap: compare at the same frame
+                kk = max(k_ for k_ in B if k_ <= ea) if any(k_ <= ea for k_ in B) else sb
+                ka = max(k_ for k_ in A if k_ <= kk)
+                dd = np.linalg.norm(cen_ref(kk, B[kk]) - cen_ref(ka, A[ka]))
+            else:
+                dd = np.linalg.norm(cen_ref(sb, B[sb]) - ca)
+            if dd < 1.5 * ha * (1 + (sb - ea) / (6 * a.det_every)) and dd < bd: best, bd = ib, dd
+        if best is not None:
+            for k_, b_ in tracks[best].items():
+                if k_ > ea: A[k_] = b_
+            del tracks[best]; merged = True; break
 def score(tb):
-    cxs = [(b[0] + b[2]) / 2 for b in tb.values()]; hs = [b[3] - b[1] for b in tb.values()]
-    if a.view in ('side', 'wide'): return len(tb) * 0.2 * a.det_every + (max(cxs) - min(cxs))
+    ks_ = sorted(tb); cr = np.array([cen_ref(k, tb[k]) for k in ks_]); hs = [tb[k][3] - tb[k][1] for k in ks_]
+    if a.view in ('side', 'wide'): return len(tb) * 0.2 * a.det_every + (cr[:, 0].max() - cr[:, 0].min())
     return len(tb) * 0.5 * a.det_every + (max(hs) - min(hs)) * 3
 tracks.sort(key=lambda t: -score(t))
 ath = dict(tracks[0])
@@ -134,6 +165,7 @@ for k, f in enumerate(frames):
     res.append(rec)
     if k % 50 == 0: print(f'  pose {k}/{N}', flush=True)
 json.dump({'fps': real_fps, 'W': W, 'H': H, 'frames': res}, open(f'{a.out}/kp.json', 'w'))
+json.dump({str(k): v for k, v in all_dets.items()}, open(f'{a.out}/detections.json', 'w'))
 
 picks = np.linspace(0, N - 1, 8).astype(int); tiles = []
 for k in picks:

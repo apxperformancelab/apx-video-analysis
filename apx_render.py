@@ -18,11 +18,14 @@ warnings.filterwarnings('ignore')
 from PIL import Image, ImageDraw, ImageFont
 
 ap = argparse.ArgumentParser()
-ap.add_argument('mode', choices=['accel', 'plain', 'still', 'reel', 'video'])
+ap.add_argument('mode', choices=['accel', 'maxv', 'plain', 'still', 'reel', 'video'])
 ap.add_argument('--work', required=True); ap.add_argument('--name', required=True); ap.add_argument('--out', required=True)
 ap.add_argument('--label', default='10m Front'); ap.add_argument('--frame', type=int); ap.add_argument('--slot', default='Still'); ap.add_argument('--caption', default=''); ap.add_argument('--trunk-only', action='store_true')
-ap.add_argument('--stills', nargs='*', default=[]); ap.add_argument('--inputs', nargs='*', default=[]); ap.add_argument('--test', default='10m Acceleration')
+ap.add_argument('--stills', nargs='*', default=[]); ap.add_argument('--inputs', nargs='*', default=[]); ap.add_argument('--test', default=None); ap.add_argument('--dist', type=float, default=None)
 a = ap.parse_args()
+if a.test is None: a.test = '30m Max Velocity' if a.mode == 'maxv' else '10m Acceleration'
+if a.dist is None: a.dist = 30.0 if (a.mode == 'maxv' or a.test.startswith('30')) else 10.0
+TESTTAG = a.test.split()[0]
 os.makedirs(a.out, exist_ok=True)
 TAG = a.name.strip().replace(' ', '_')
 
@@ -97,22 +100,30 @@ def angle_marker(img, base, ang, length, sc_off, col, label):
 
 def touchdown_tiles(st, dist, w=400):
     tiles = []
-    for s_ in st[(st.foot_pos_m > 0.3) & (st.foot_pos_m <= dist + 0.2)].itertuples():
+    sel_ = st if st.foot_pos_m.isna().all() or a.mode == 'maxv' else st[(st.foot_pos_m > 0.3) & (st.foot_pos_m <= dist + 0.2)]
+    for s_ in sel_.itertuples():
         i = int(s_.td_frame); size = int(CS * 0.95); x0, y0 = crop_box(i, size)
         z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (w, w), interpolation=cv2.INTER_CUBIC)
         draw_skel(z, K[i], w / size, (x0, y0), 2)
         pad = np.zeros((130, w, 3), np.uint8); pad[:] = bgr(BG)
-        tiles.append(put(np.vstack([z, pad]), [(f'STEP {s_.step}  ·  {s_.foot_pos_m:.1f} m', (14, w + 10), 26, FLUORO),
-                    (f'Shin {s_.shin_TD:.0f}°   Trunk {s_.trunk_TD:.0f}°', (14, w + 50), 23, WHITE),
-                    (f'Foot {s_.foot_vs_hip_cm:+.0f} cm vs hip', (14, w + 86), 23, WHITE)]))
+        pos = f'  ·  {s_.foot_pos_m:.1f} m' if pd.notna(s_.foot_pos_m) else ''
+        fv = f'Foot {s_.foot_vs_hip_cm:+.0f} cm vs hip' if pd.notna(s_.foot_vs_hip_cm) else f'Foot {getattr(s_, "foot_vs_hip_pctL", float("nan")):+.0f}% leg vs hip'
+        tiles.append(put(np.vstack([z, pad]), [(f'STEP {s_.step}{pos}', (14, w + 10), 26, FLUORO),
+                    (f'Shin {s_.shin_TD:.0f}°   Trunk {s_.trunk_TD:.0f}°', (14, w + 50), 23, WHITE), (fv, (14, w + 86), 23, WHITE)]))
     return tiles
 
-def still(i, annotate, title, lines, fname, step=None, trunk_only=False):
+def still(i, annotate, title, lines, fname, step=None, trunk_only=False, only_leg=None):
     size = int(np.clip(spanf[i] * 1.6, 80, min(W, H))); x0, y0 = crop_box(i, size)
     z = cv2.resize(frames[i][y0:y0 + size, x0:x0 + size], (1080, 1080), interpolation=cv2.INTER_CUBIC)
     if annotate:
         sc = 1080 / size; k = K[i]
-        if trunk_only:
+        if only_leg is not None:   # trunk + one leg (e.g. the push-off leg at toe-off)
+            qq = lambda xy: (int((xy[0] - x0) * sc), int((xy[1] - y0) * sc))
+            h_, s_ = qq((k[11] + k[12]) / 2), qq((k[5] + k[6]) / 2); kn, an = (13, 15) if only_leg == 'L' else (14, 16)
+            cv2.line(z, h_, s_, bgr(TRUNK), 6, cv2.LINE_AA); cv2.line(z, h_, qq(k[kn]), bgr(FLUORO), 5, cv2.LINE_AA); cv2.line(z, qq(k[kn]), qq(k[an]), bgr(FLUORO), 5, cv2.LINE_AA)
+            for p_ in (h_, s_): cv2.circle(z, p_, 9, bgr(TRUNK), -1, cv2.LINE_AA)
+            for p_ in (qq(k[kn]), qq(k[an])): cv2.circle(z, p_, 8, bgr(FLUORO), -1, cv2.LINE_AA)
+        elif trunk_only:
             qq = lambda xy: (int((xy[0] - x0) * sc), int((xy[1] - y0) * sc))
             h_, s_ = qq((k[11] + k[12]) / 2), qq((k[5] + k[6]) / 2)
             ext = (int(h_[0] + (s_[0] - h_[0]) * 1.25), int(h_[1] + (s_[1] - h_[1]) * 1.25))
@@ -136,9 +147,10 @@ def still(i, annotate, title, lines, fname, step=None, trunk_only=False):
     if annotate:
         json.dump({'title': title, 'lines': lines, 'frame': int(i)}, open(fname.replace('.jpg', '.json'), 'w'))
 
-if a.mode == 'accel':
-    df = pd.read_csv(f'{A}/per_frame.csv'); st = pd.read_csv(f'{A}/steps.csv'); ph = pd.read_csv(f'{A}/phases.csv')
-    summ = json.load(open(f'{A}/summary.json')); dist = 10.0
+if a.mode in ('accel', 'maxv'):
+    df = pd.read_csv(f'{A}/per_frame.csv'); st = pd.read_csv(f'{A}/steps.csv')
+    ph = pd.read_csv(f'{A}/phases.csv') if os.path.exists(f'{A}/phases.csv') else pd.DataFrame()
+    summ = json.load(open(f'{A}/summary.json')); dist = a.dist
     # which leg is planted at each touchdown (closest ankle to footprint) for drawing the shin reference
     def planted_leg(r):
         f = int(r.td_frame); xf = None
@@ -154,30 +166,32 @@ if a.mode == 'accel':
         full = frames[i].copy(); cv2.rectangle(full, (x0, y0), (x0 + CS, y0 + CS), bgr(FLUORO), max(2, W // 400))
         iw = 520; ih = int(iw * H / W); cv_[20:20 + ih, OH + 20:OH + 20 + iw] = cv2.resize(full, (iw, ih))
         r = df.iloc[i]; X = OH + 24; Y = 20 + ih + 24; items = []
-        items.append((f'{a.name.upper()}  |  10M ACCELERATION', (X, Y), 22, FLUORO)); Y += 44
-        items.append((f'Distance   {max(r.hip_x_m, 0):4.1f} m', (X, Y), 26, WHITE)); Y += 38
+        items.append((f'{a.name.upper()}  |  {a.test.upper()}', (X, Y), 22, FLUORO)); Y += 44
+        if pd.notna(r.hip_x_m): items.append((f'Distance   {max(r.hip_x_m, 0):4.1f} m', (X, Y), 26, WHITE))
+        Y += 38
         items.append((f'Trunk lean   {r.trunk_lean_deg:3.0f}°', (X, Y), 26, TRUNK)); Y += 46
         if i in td: hold = (td[i], 14)
         if hold:
             s, n = hold
             items.append((f'TOUCHDOWN  ·  STEP {s.step}', (X, Y), 24, FLUORO)); Y += 36
-            items.append((f'Shin {s.shin_TD:.0f}°   Foot {s.foot_vs_hip_cm:+.0f} cm vs hip', (X, Y), 22, WHITE)); Y += 32
+            fv = f'Foot {s.foot_vs_hip_cm:+.0f} cm vs hip' if pd.notna(s.foot_vs_hip_cm) else (f'Foot {s.foot_vs_hip_pctL:+.0f}% leg vs hip' if 'foot_vs_hip_pctL' in st else '')
+            items.append((f'Shin {s.shin_TD:.0f}°   {fv}', (X, Y), 22, WHITE)); Y += 32
             extra = f'Step {s.step_length_m:.2f} m' if pd.notna(s.step_length_m) else ''
             if pd.notna(s.contact_ms): extra += f'   Contact ~{s.contact_ms:.0f} ms'
             items.append((extra, (X, Y), 22, WHITE))
             hold = (s, n - 1) if n > 1 else None
         by = OH - 56; bx0, bx1 = X, OW - 36
         cv2.line(cv_, (bx0, by), (bx1, by), bgr(GREY), 2)
-        for mm in (0, 5, 10):
+        for mm in (0, dist / 2, dist):
             xx = int(bx0 + (bx1 - bx0) * mm / dist); cv2.line(cv_, (xx, by - 8), (xx, by + 8), bgr(GREY), 2)
-            items.append((f'{mm}m', (xx - 12, by + 14), 16, GREY))
+            items.append((f'{mm:g}m', (xx - 12, by + 14), 16, GREY))
         for s in st.itertuples():
-            if s.td_frame <= i and 0 <= s.foot_pos_m <= dist + 0.5:
+            if s.td_frame <= i and pd.notna(s.foot_pos_m) and 0 <= s.foot_pos_m <= dist + 0.5:
                 cv2.circle(cv_, (int(bx0 + (bx1 - bx0) * min(s.foot_pos_m, dist) / dist), by), 6, bgr(FLUORO), -1, cv2.LINE_AA)
-        cv2.circle(cv_, (int(bx0 + (bx1 - bx0) * np.clip(r.hip_x_m, 0, dist) / dist), by - 20), 8, bgr(WHITE), -1, cv2.LINE_AA)
+        if pd.notna(r.hip_x_m): cv2.circle(cv_, (int(bx0 + (bx1 - bx0) * np.clip(r.hip_x_m, 0, dist) / dist), by - 20), 8, bgr(WHITE), -1, cv2.LINE_AA)
         items.append(('Fluoro / white = the two legs & arms   Blue = trunk   Dots = footprints', (20, OH - 30), 15, WHITE))
         vw.write(put(cv_, items))
-    vw.release(); encode(raw, f'{a.out}/APX_{TAG}_10m_Side_Overlay.mp4')
+    vw.release(); encode(raw, f'{a.out}/APX_{TAG}_{TESTTAG}_{"Side" if a.mode == "accel" else "Wide" if summ.get("camera_pan_px", 0) and summ.get("camera_pan_px", 0) > 200 else "Side"}_Overlay.mp4')
 
     # touchdown reel
     tiles = touchdown_tiles(st, dist)
@@ -187,19 +201,37 @@ if a.mode == 'accel':
         while len(row) < per: row.append(np.full_like(tiles[0], BG[0]))
         rows_.append(np.hstack(row))
     head = np.zeros((90, rows_[0].shape[1], 3), np.uint8); head[:] = bgr(BG)
-    head = put(head, [(f'{a.name.upper()}  |  10M ACCELERATION  |  TOUCHDOWN REEL', (20, 26), 32, FLUORO),
+    head = put(head, [(f'{a.name.upper()}  |  {a.test.upper()}  |  TOUCHDOWN REEL', (20, 26), 32, FLUORO),
                       ('APX PERFORMANCE LAB', (rows_[0].shape[1] - 340, 32), 24, GREY)])
-    cv2.imwrite(f'{a.out}/APX_{TAG}_10m_Touchdown_Reel.jpg', np.vstack([head] + rows_), [cv2.IMWRITE_JPEG_QUALITY, 90])
+    cv2.imwrite(f'{a.out}/APX_{TAG}_{TESTTAG}_Touchdown_Reel.jpg', np.vstack([head] + rows_), [cv2.IMWRITE_JPEG_QUALITY, 90])
 
     # report slot stills
-    ed = summ['slot_frames']['early_drive']
+    sf_ = summ.get('slot_frames', {})
+    if a.mode == 'maxv':
+        def legs_apart(i):
+            k = K[i]; h = spanf[i]
+            return np.linalg.norm(k[13] - k[14]) > 0.06 * h or np.linalg.norm(k[15] - k[16]) > 0.06 * h
+        good = st[st.shin_TD.notna() & st.td_frame.map(lambda f: legs_apart(int(f))) & st.to_frame.map(lambda f: legs_apart(int(f)))]
+        if not len(good): print('WARNING: no step with both legs tracked separately at touchdown and toe-off; stills skipped')
+        if len(good):
+            mid = good.iloc[len(good) // 2]
+            fv = f'{mid.foot_vs_hip_cm:+.0f} cm' if pd.notna(mid.foot_vs_hip_cm) else f'{mid.foot_vs_hip_pctL:+.0f}% leg'
+            for ann in (True, False):
+                still(int(mid['td_frame']), ann, 'Max Velocity · Ground Contact', [f'Step {int(mid.step)}' + (f' at {mid.foot_pos_m:.1f} m' if pd.notna(mid.foot_pos_m) else '') + f'   Shin {mid.shin_TD:.0f}°   Trunk {mid.trunk_TD:.0f}°', f'Foot {fv} vs hip at touchdown'],
+                      f'{a.out}/APX_{TAG}_{TESTTAG}_Ground_Contact_{"annotated" if ann else "clean"}.jpg')
+                fto = int(mid['to_frame']); dirx_ = -1 if summ.get('running_dir') == 'left' else 1
+                push = 'L' if (K[fto, 15, 0] - K[fto, 11:13, 0].mean()) * dirx_ < (K[fto, 16, 0] - K[fto, 11:13, 0].mean()) * dirx_ else 'R'
+                still(fto, ann, 'Max Velocity · Toe Off', [f'Step {int(mid.step)}: push-off leg and trunk', f'Hip angle {mid.hip_TO:.0f}° (approx)'],
+                      f'{a.out}/APX_{TAG}_{TESTTAG}_Toe_Off_{"annotated" if ann else "clean"}.jpg', only_leg=push)
+    ed = sf_.get('early_drive') if a.mode == 'accel' else None
     if ed is not None:
         s = st[st.td_frame == ed].iloc[0]
         lines = [f'Step {int(s.step)} at {s.foot_pos_m:.1f} m   Shin {s.shin_TD:.0f}°   Trunk {s.trunk_TD:.0f}°', f'Foot {s.foot_vs_hip_cm:+.0f} cm vs hip at touchdown']
         for ann in (True, False):
             still(ed, ann, 'Acceleration · Early Drive Phase', lines, f'{a.out}/APX_{TAG}_10m_Early_Drive_{"annotated" if ann else "clean"}.jpg', {'leg': planted_leg(s)})
-    pl = summ['slot_frames']['peak_lean']; r = df.iloc[pl]
-    for ann in (True, False):
+    pl = sf_.get('peak_lean') if a.mode == 'accel' else None
+    for ann in ((True, False) if pl is not None else ()):
+        r = df.iloc[pl]
         still(pl, ann, 'Acceleration · Peak Drive Lean', [f'Trunk lean {r.trunk_lean_deg:.0f}° at {max(r.hip_x_m, 0):.1f} m'],
               f'{a.out}/APX_{TAG}_10m_Peak_Drive_Lean_{"annotated" if ann else "clean"}.jpg', trunk_only=True)
 
@@ -210,16 +242,17 @@ if a.mode == 'accel':
         'knee_TD': 'Knee angle at touchdown (°)', 'hip_TO': 'Hip angle at toe-off (°, approx)', 'knee_TO': 'Knee angle at toe-off (°, approx)',
         'body_lean_TO': 'Body lean at toe-off, foot-to-hip (°)', 'peak_front_thigh': 'Peak front thigh (° from vertical, approx)',
         'contact_ms': 'Ground contact (ms, approx)', 'flight_ms': 'Flight (ms, approx)', 'step_freq_hz': 'Step frequency (steps/s)',
-        'speed_ms': 'Speed (m/s)', 'td_frame': 'Touchdown frame', 'to_frame': 'Toe-off frame'}).drop(columns=['timing_ok', 'step_time_ms'])
-    with pd.ExcelWriter(f'{a.out}/APX_{TAG}_10m_Data.xlsx') as xw:
-        nice.to_excel(xw, sheet_name='Steps', index=False); ph.to_excel(xw, sheet_name='Phases', index=False)
+        'speed_ms': 'Speed (m/s)', 'td_frame': 'Touchdown frame', 'to_frame': 'Toe-off frame', 'foot_vs_hip_pctL': 'Foot vs hip (% leg length)', 'knee_flex_stance': 'Knee flexion in stance (°, approx)', 'step_length_legs': 'Step length (leg lengths)', 'view_angle_deg': 'Camera view angle off square (°)', 'leg': 'Leg (A/B alternate)'}).drop(columns=['timing_ok', 'step_time_ms', 'knee_min_stance'], errors='ignore')
+    with pd.ExcelWriter(f'{a.out}/APX_{TAG}_{TESTTAG}_Data.xlsx') as xw:
+        nice.to_excel(xw, sheet_name='Steps', index=False)
+        if len(ph): ph.to_excel(xw, sheet_name='Phases', index=False)
         pd.DataFrame([{'item': k, 'value': json.dumps(v) if isinstance(v, (dict, list)) else v} for k, v in summ.items()]).to_excel(xw, sheet_name='Summary', index=False)
     import openpyxl
-    wb = openpyxl.load_workbook(f'{a.out}/APX_{TAG}_10m_Data.xlsx')
+    wb = openpyxl.load_workbook(f'{a.out}/APX_{TAG}_{TESTTAG}_Data.xlsx')
     for ws in wb.worksheets:
         for col in ws.iter_cols(min_row=1, max_row=1):
             ws.column_dimensions[col[0].column_letter].width = 24
-    wb.save(f'{a.out}/APX_{TAG}_10m_Data.xlsx')
+    wb.save(f'{a.out}/APX_{TAG}_{TESTTAG}_Data.xlsx')
     print('accel outputs written to', a.out)
 
 elif a.mode == 'plain':
@@ -283,7 +316,7 @@ elif a.mode == 'reel':
         x = (RW - len(keys) * (RW // 3)) // 2
         for k_ in keys: row[:, x:x + k_.shape[1]] = k_; x += k_.shape[1]
         parts.append(row)
-    tiles = touchdown_tiles(st, 10.0)
+    tiles = touchdown_tiles(st, a.dist)
     if tiles:
         parts.append(bar(50, [('EVERY TOUCHDOWN  (side-on, measured at foot contact)', (24, 12), 24, GREY)]))
         for r0 in range(0, len(tiles), 4):
@@ -303,4 +336,9 @@ elif a.mode == 'video':
     subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', lst, '-vf', 'scale=1280:720,fps=30',
                     '-c:v', 'libx264', '-preset', 'slow', '-crf', '30', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', out], check=True)
     os.remove(lst)
+    crf = 30
+    while os.path.getsize(out) > 4e6 and crf < 38:
+        crf += 3; tmp = out.replace('.mp4', '_tmp.mp4')
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', out, '-c:v', 'libx264', '-preset', 'slow', '-crf', str(crf), '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', tmp], check=True)
+        os.replace(tmp, out)
     print('report video written', out, round(os.path.getsize(out) / 1e6, 2), 'MB')
