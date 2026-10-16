@@ -12,6 +12,11 @@ Any clip, skeleton only (front-on until front metrics are validated):
 
 Export a still from any analysed clip:
   python3 apx_render.py still --work WORKDIR --name "Athlete Name" --out OUTDIR --frame K --slot "10m Front-On Arm and Knee Drive"
+
+Steps with a visibly wrong skeleton (accel, maxv and reel):
+  add --bad-steps 6        (comma list for several, e.g. --bad-steps 6,9; pipeline step numbers as in steps.csv)
+    -> overlay video keeps the footprint dot so the step sequence stays complete, but shows no touchdown card;
+       the Touchdown Reel and the Report Reel leave the step out. Pass the same list to accel and to reel.
 """
 import argparse, json, os, subprocess, warnings, cv2, numpy as np, pandas as pd
 warnings.filterwarnings('ignore')
@@ -22,7 +27,9 @@ ap.add_argument('mode', choices=['accel', 'maxv', 'cod', 'plain', 'still', 'reel
 ap.add_argument('--work', required=True); ap.add_argument('--name', required=True); ap.add_argument('--out', required=True)
 ap.add_argument('--label', default='10m Front'); ap.add_argument('--frame', type=int); ap.add_argument('--slot', default='Still'); ap.add_argument('--caption', default=''); ap.add_argument('--trunk-only', action='store_true')
 ap.add_argument('--stills', nargs='*', default=[]); ap.add_argument('--inputs', nargs='*', default=[]); ap.add_argument('--test', default=None); ap.add_argument('--dist', type=float, default=None)
+ap.add_argument('--bad-steps', default='', help='comma list of pipeline step numbers with a wrong skeleton: dot kept in the overlay, card and reel tile dropped')
 a = ap.parse_args()
+BAD = {int(x) for x in a.bad_steps.replace(' ', '').split(',') if x}
 if a.test is None: a.test = {'maxv': '30m Max Velocity', 'cod': '505'}.get(a.mode, '10m Acceleration')
 if a.dist is None: a.dist = 30.0 if (a.mode == 'maxv' or a.test.startswith('30')) else 10.0
 TESTTAG = a.test.replace(' Max Velocity', '').replace(' Acceleration', '').replace(' ', '_')
@@ -100,6 +107,7 @@ def angle_marker(img, base, ang, length, sc_off, col, label):
 
 def touchdown_tiles(st, dist, w=400):
     tiles = []
+    if BAD: st = st[~st.step.astype(int).isin(BAD)]
     sel_ = st if st.foot_pos_m.isna().all() or a.mode == 'maxv' else st[(st.foot_pos_m > 0.3) & (st.foot_pos_m <= dist + 0.2)]
     for s_ in sel_.itertuples():
         i = int(s_.td_frame); size = int(CS * 0.95); x0, y0 = crop_box(i, size)
@@ -175,7 +183,7 @@ if a.mode in ('accel', 'maxv'):
     def planted_leg(r):
         f = int(r.td_frame); xf = None
         return 'L' if abs(df.loc[f, 'shin_L'] - r.shin_TD) <= abs(df.loc[f, 'shin_R'] - r.shin_TD) else 'R'
-    td = {int(r.td_frame): r for r in st.itertuples()}
+    td = {int(r.td_frame): r for r in st.itertuples() if int(r.step) not in BAD}
     OW, OH = 1280, 720
     raw = f'{a.out}/_raw.mp4'; vw = cv2.VideoWriter(raw, cv2.VideoWriter_fourcc(*'mp4v'), 30, (OW, OH)); hold = None
     for i in range(N):
