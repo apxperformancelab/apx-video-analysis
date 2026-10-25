@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(bash /home/claude/apx-video-analysis/setup.sh)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_track.py *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_calib.py grid *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_calib.py convert *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_maxv.py *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_render.py maxv *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_render.py plain *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_render.py still *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_render.py reel *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_render.py video *)",
+      "Bash(mkdir -p ~/apx/jobs/*)",
+      "Bash(pgrep -af apx_track.py)",
+      "Read(~/apx/jobs/**)",
+      "Edit(~/apx/jobs/**/meta.json)",
+      "Edit(~/apx/jobs/**/kp.json)"
+    ],
+    "ask": [
+      "Bash(curl *)",
+      "Bash(wget *)"
+    ],
+    "additionalDirectories": [
+      "~/apx/jobs"
+    ]
+  }
+}
