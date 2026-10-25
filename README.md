@@ -5,7 +5,8 @@ Runs on onnxruntime (CPU), no torch. Models: YOLO11 detection + pose (Ultralytic
 
 Setup in a fresh environment:
 
-    curl -sSL https://raw.githubusercontent.com/apxperformancelab/apx-video-analysis/main/setup.sh | bash
+    git clone --depth 1 https://github.com/apxperformancelab/apx-video-analysis
+    bash apx-video-analysis/setup.sh
 
 Scripts (run in order): apx_track.py -> apx_calib.py -> the test script (apx_accel.py for the 10m, apx_maxv.py for the 30m, apx_505.py for the 505) -> apx_render.py. Each has usage notes at the top.
 No athlete footage or data is stored in this repository.
