@@ -6,6 +6,8 @@
       "Bash(python3 /home/claude/apx-video-analysis/apx_track.py *)",
       "Bash(python3 /home/claude/apx-video-analysis/apx_calib.py grid *)",
       "Bash(python3 /home/claude/apx-video-analysis/apx_calib.py convert *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_calib.py crop *)",
+      "Bash(python3 /home/claude/apx-video-analysis/apx_calib.py fps *)",
       "Bash(python3 /home/claude/apx-video-analysis/apx_accel.py *)",
       "Bash(python3 /home/claude/apx-video-analysis/apx_maxv.py *)",
       "Bash(python3 /home/claude/apx-video-analysis/apx_505.py *)",
@@ -19,10 +21,12 @@
       "Bash(ffmpeg -v error -y -i *)",
       "Bash(mkdir -p ~/apx/jobs/*)",
       "Bash(pgrep -af apx_track.py)",
+      "Bash(ls -la ~/apx/jobs/*)",
       "Read(~/apx/jobs/**)",
       "Read(//mnt/user-data/uploads/**)",
       "Edit(~/apx/jobs/**/meta.json)",
-      "Edit(~/apx/jobs/**/kp.json)"
+      "Edit(~/apx/jobs/**/kp.json)",
+      "Edit(~/apx/jobs/**/out/**)"
     ],
     "ask": [
       "Bash(curl *)",
